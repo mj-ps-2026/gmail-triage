@@ -10,10 +10,11 @@ import fetch from "node-fetch";
 const {
   GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN,
   GEMINI_API_KEY, DIGEST_TO_EMAIL,
-  LOOKBACK_HOURS = "1", DRY_RUN = "false",
+  LOOKBACK_HOURS = "1", DRY_RUN = "false", SEND_DIGEST = "false",
 } = process.env;
 
 const isDryRun = DRY_RUN === "true";
+const isSendDigest = SEND_DIGEST === "true";
 const lookbackMs = parseFloat(LOOKBACK_HOURS) * 60 * 60 * 1000;
 
 // Pre-classified as DIGEST (useful, no action, remove from inbox)
@@ -247,7 +248,11 @@ async function main() {
   const allInbox = [...preInbox, ...aiInbox];
   const allDigest = [...preDigest, ...aiDigest];
   console.log(`\n📊 ${allInbox.length} inbox, ${allDigest.length} digest`);
-  await sendDigest(gmail, allInbox, allDigest);
+  if (isSendDigest) {
+    await sendDigest(gmail, allInbox, allDigest);
+  } else {
+    console.log("📭 Digest suppressed (archive-only run).");
+  }
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

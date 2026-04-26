@@ -1,15 +1,16 @@
 name: Inbox Triage
 
 on:
-  # Run every 15 minutes
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # archive-only, every 15 min
+    - cron: "0 13 * * *"     # digest 9am ET (UTC-4), 12h lookback
+    - cron: "0 19 * * *"     # digest 3pm ET, 6h lookback
+    - cron: "0 1 * * *"      # digest 9pm ET, 6h lookback
 
-  # Manual trigger — set backfill=true to sweep all historical email
   workflow_dispatch:
     inputs:
-      backfill:
-        description: "Backfill mode (triage ALL inbox email, not just last 15 min)"
+      send_digest:
+        description: "Send digest email"
         required: false
         default: "false"
         type: boolean
@@ -19,9 +20,9 @@ on:
         default: "false"
         type: boolean
       lookback_hours:
-        description: "Custom lookback window in hours (overrides backfill if set)"
+        description: "Custom lookback window in hours"
         required: false
-        default: ""
+        default: "1"
         type: string
 
 jobs:
@@ -42,15 +43,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Determine lookback window
-        id: window
+      - name: Determine mode
+        id: mode
         run: |
+          SCHEDULE="${{ github.event.schedule }}"
           if [ -n "${{ github.event.inputs.lookback_hours }}" ]; then
             echo "hours=${{ github.event.inputs.lookback_hours }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.inputs.backfill }}" = "true" ]; then
-            echo "hours=8760" >> $GITHUB_OUTPUT   # 1 year
+            echo "send_digest=${{ github.event.inputs.send_digest || 'false' }}" >> $GITHUB_OUTPUT
+          elif [ "$SCHEDULE" = "0 13 * * *" ]; then
+            echo "hours=12" >> $GITHUB_OUTPUT
+            echo "send_digest=true" >> $GITHUB_OUTPUT
+          elif [ "$SCHEDULE" = "0 19 * * *" ] || [ "$SCHEDULE" = "0 1 * * *" ]; then
+            echo "hours=6" >> $GITHUB_OUTPUT
+            echo "send_digest=true" >> $GITHUB_OUTPUT
           else
-            echo "hours=1" >> $GITHUB_OUTPUT       # normal incremental window
+            echo "hours=0.5" >> $GITHUB_OUTPUT
+            echo "send_digest=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Run triage
@@ -60,6 +68,7 @@ jobs:
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DIGEST_TO_EMAIL: ${{ secrets.DIGEST_TO_EMAIL }}
-          LOOKBACK_HOURS: ${{ steps.window.outputs.hours }}
+          LOOKBACK_HOURS: ${{ steps.mode.outputs.hours }}
+          SEND_DIGEST: ${{ steps.mode.outputs.send_digest }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: node triage.js
