@@ -244,21 +244,27 @@ async function main() {
   if (!threads.length) return;
 
   const emails = [];
-  for (const t of threads) {
-    try {
+  const FETCH_CONCURRENCY = 5;
+  for (let i = 0; i < threads.length; i += FETCH_CONCURRENCY) {
+    const batch = threads.slice(i, i + FETCH_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map(async (t) => {
       const d = await gmail.users.threads.get({ userId: "me", id: t.id, format: "METADATA", metadataHeaders: ["From", "Subject", "List-Unsubscribe", "List-Unsubscribe-Post"] });
       const msg = d.data.messages?.[0];
       const h = msg?.payload?.headers ?? [];
-      emails.push({
+      return {
         id: t.id,
         from: extractHeader(h, "From"),
         subject: extractHeader(h, "Subject"),
-        snippet: msg?.snippet?.slice(0, 200) ?? "",
+        snippet: msg?.snippet?.slice(0, 100) ?? "",
         listUnsubscribe: extractHeader(h, "List-Unsubscribe"),
         listUnsubscribePost: extractHeader(h, "List-Unsubscribe-Post"),
-      });
-    } catch (e) { console.warn(`Skip ${t.id}: ${e.message}`); }
-    await sleep(50);
+      };
+    }));
+    for (const r of results) {
+      if (r.status === "fulfilled") emails.push(r.value);
+      else console.warn(`Skip thread: ${r.reason?.message}`);
+    }
+    if (i + FETCH_CONCURRENCY < threads.length) await sleep(200);
   }
 
   const forAI = [], preInbox = [], preDigest = [], preArchive = [];
@@ -276,24 +282,45 @@ async function main() {
   for (const e of preDigest) { console.log(`📋 ${e.from} — ${e.subject}`); await archiveThread(gmail, e.id); await sleep(100); }
 
   const aiInbox = [], aiDigest = [];
-  for (let i = 0; i < forAI.length; i += 15) {
-    const batch = forAI.slice(i, i + 15);
-    console.log(`\n🤖 Batch ${Math.floor(i/15)+1}/${Math.ceil(forAI.length/15)} (${batch.length})...`);
-    try {
-      const results = await classifyBatch(batch);
-      const map = Object.fromEntries(results.map((r) => [r.id, r]));
-      for (const e of batch) {
-        const r = map[e.id];
-        if (!r) { aiInbox.push({ ...e, summary: "(unclassified)" }); continue; }
-        if (r.tier === "archive") { console.log(`🗑️  ${e.from} — ${e.subject}`); await tryUnsubscribe(gmail, e); await archiveThread(gmail, e.id); await sleep(100); }
-        else if (r.tier === "digest") { console.log(`📋 [${r.category || "Other"}] ${e.from} — ${e.subject}`); aiDigest.push({ ...e, summary: r.summary, category: r.category || "Other" }); await archiveThread(gmail, e.id); await sleep(100); }
-        else { console.log(`⚡ ${e.from} — ${e.subject}`); aiInbox.push({ ...e, summary: r.summary }); }
-      }
-    } catch (err) {
-      console.error(`Gemini error: ${err.message}`);
-      for (const e of batch) aiInbox.push({ ...e, summary: "(AI error)" });
+  const domainCache = new Map(); // domain → AI result, reused within a run
+  const BATCH_SIZE = 20;
+
+  async function applyResult(e, r) {
+    if (!r) { aiInbox.push({ ...e, summary: "(unclassified)" }); return; }
+    if (r.tier === "archive") { console.log(`🗑️  ${e.from} — ${e.subject}`); await tryUnsubscribe(gmail, e); await archiveThread(gmail, e.id); await sleep(100); }
+    else if (r.tier === "digest") { console.log(`📋 [${r.category || "Other"}] ${e.from} — ${e.subject}`); aiDigest.push({ ...e, summary: r.summary, category: r.category || "Other" }); await archiveThread(gmail, e.id); await sleep(100); }
+    else { console.log(`⚡ ${e.from} — ${e.subject}`); aiInbox.push({ ...e, summary: r.summary }); }
+  }
+
+  for (let i = 0; i < forAI.length; i += BATCH_SIZE) {
+    const window = forAI.slice(i, i + BATCH_SIZE);
+    const needsAI = [], cached = [];
+    for (const e of window) {
+      const d = getSenderDomain(e.from);
+      domainCache.has(d) ? cached.push({ e, r: domainCache.get(d) }) : needsAI.push(e);
     }
-    await sleep(1000);
+
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const total = Math.ceil(forAI.length / BATCH_SIZE);
+    console.log(`\n🤖 Batch ${batchNum}/${total} — ${needsAI.length} to AI, ${cached.length} cached`);
+
+    for (const { e, r } of cached) await applyResult(e, r);
+
+    if (needsAI.length) {
+      try {
+        const results = await classifyBatch(needsAI);
+        const map = Object.fromEntries(results.map((r) => [r.id, r]));
+        for (const e of needsAI) {
+          const r = map[e.id];
+          if (r) domainCache.set(getSenderDomain(e.from), r);
+          await applyResult(e, r);
+        }
+      } catch (err) {
+        console.error(`Gemini error: ${err.message}`);
+        for (const e of needsAI) aiInbox.push({ ...e, summary: "(AI error)" });
+      }
+      await sleep(1000);
+    }
   }
 
   const allInbox = [...preInbox, ...aiInbox];
