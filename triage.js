@@ -1,65 +1,55 @@
 #!/usr/bin/env node
 /**
- * inbox-triage.js
- * ---------------
- * Fetches recent Gmail threads, classifies each with Gemini 2.0 Flash,
- * archives junk, and sends a digest of what's left.
- *
- * Env vars required (set as GitHub Actions secrets):
- *   GMAIL_CLIENT_ID
- *   GMAIL_CLIENT_SECRET
- *   GMAIL_REFRESH_TOKEN
- *   GEMINI_API_KEY
- *   DIGEST_TO_EMAIL        (your gmail address)
- *
- * Optional:
- *   LOOKBACK_HOURS         (default: 1 — set to e.g. 8760 for backfill)
- *   DRY_RUN                (set to "true" to skip archiving/sending)
+ * inbox-triage.js — 3-tier version
+ * Tiers: inbox (action needed) | digest (FYI, archived) | archive (junk)
  */
 
 import { google } from "googleapis";
 import fetch from "node-fetch";
 
-// ─── Config ──────────────────────────────────────────────────────────────────
-
 const {
-  GMAIL_CLIENT_ID,
-  GMAIL_CLIENT_SECRET,
-  GMAIL_REFRESH_TOKEN,
-  GEMINI_API_KEY,
-  DIGEST_TO_EMAIL,
-  LOOKBACK_HOURS = "1",
-  DRY_RUN = "false",
+  GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN,
+  GEMINI_API_KEY, DIGEST_TO_EMAIL,
+  LOOKBACK_HOURS = "1", DRY_RUN = "false",
 } = process.env;
 
 const isDryRun = DRY_RUN === "true";
 const lookbackMs = parseFloat(LOOKBACK_HOURS) * 60 * 60 * 1000;
 
-// Senders / domains that are ALWAYS kept regardless of AI classification
-const ALWAYS_KEEP_PATTERNS = [
+// Pre-classified as DIGEST (useful, no action, remove from inbox)
+const ALWAYS_DIGEST_PATTERNS = [
   /monarch\.com$/i,
-  /igotanoffer\.com$/i,
   /musicologie\.app$/i,
-  /gethealthie\.com$/i,
   /parentsquare\.com$/i,
   /ptboard\.com$/i,
   /amazon\.com$/i,
   /accounts\.google\.com$/i,
-  /anthropic\.com$/i,
-  /github\.com$/i,
-  /linkedin\.com$/i,          // job alerts — keep
+  /linkedin\.com$/i,
+  /substack\.com$/i,
+  /politico\.com$/i,
+  /nextdoor\.com$/i,
+  /ifttt\.com$/i,
+  /infoemail\.microsoft\.com$/i,
+  /customeremail\.microsoftrewards\.com$/i,
 ];
 
-// Senders that are ALWAYS archived (political fundraising spam)
+// Pre-classified as INBOX (always high signal, keep in inbox)
+const ALWAYS_INBOX_PATTERNS = [
+  /igotanoffer\.com$/i,
+  /gethealthie\.com$/i,
+  /anthropic\.com$/i,
+  /github\.com$/i,
+];
+
+// Always archived without AI
 const ALWAYS_ARCHIVE_PATTERNS = [
   /turnoutpac\.org$/i,
   /dccc\.org$/i,
+  /ak\.dccc\.org$/i,
   /chrispappas\.org$/i,
   /harderforcongress\.com$/i,
   /jamestalarico\.com$/i,
 ];
-
-// ─── Gmail Auth ───────────────────────────────────────────────────────────────
 
 function buildGmailClient() {
   const auth = new google.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET);
@@ -67,74 +57,45 @@ function buildGmailClient() {
   return google.gmail({ version: "v1", auth });
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function getSenderDomain(senderHeader = "") {
-  const match = senderHeader.match(/@([\w.-]+)/);
-  return match ? match[1].toLowerCase() : "";
+function getSenderDomain(s = "") {
+  const m = s.match(/@([\w.-]+)/);
+  return m ? m[1].toLowerCase() : "";
 }
 
-function isAlwaysKeep(sender) {
-  const domain = getSenderDomain(sender);
-  return ALWAYS_KEEP_PATTERNS.some((p) => p.test(domain));
-}
-
-function isAlwaysArchive(sender) {
-  const domain = getSenderDomain(sender);
-  return ALWAYS_ARCHIVE_PATTERNS.some((p) => p.test(domain));
+function preClassify(sender) {
+  const d = getSenderDomain(sender);
+  if (ALWAYS_ARCHIVE_PATTERNS.some((p) => p.test(d))) return "archive";
+  if (ALWAYS_INBOX_PATTERNS.some((p) => p.test(d))) return "inbox";
+  if (ALWAYS_DIGEST_PATTERNS.some((p) => p.test(d))) return "digest";
+  return null;
 }
 
 function extractHeader(headers, name) {
   return headers?.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ─── Gemini Classification ────────────────────────────────────────────────────
-
-/**
- * Classifies a batch of emails in a single Gemini call.
- * Returns an array of { id, action, summary } objects.
- * action: "keep" | "archive"
- */
 async function classifyBatch(emails) {
-  const emailList = emails
-    .map(
-      (e, i) =>
-        `[${i}] ID:${e.id}\nFrom: ${e.from}\nSubject: ${e.subject}\nSnippet: ${e.snippet}`
-    )
+  const list = emails
+    .map((e, i) => `[${i}] ID:${e.id}\nFrom: ${e.from}\nSubject: ${e.subject}\nSnippet: ${e.snippet}`)
     .join("\n\n");
 
-  const prompt = `You are an expert email triage assistant. Classify each email below as either ARCHIVE or KEEP.
+  const prompt = `You are triaging email for MJ, a product manager. Classify each email into one of three tiers:
 
-ARCHIVE if the email is:
-- Political fundraising, donation requests, or partisan campaign emails (these are spam even if from causes the user supports)
-- Pure retail/ecommerce promotions or sales emails (no transactional content like order confirmations)
-- Travel deal promotions
-- Generic newsletter marketing with no specific personal relevance
-- Reward program marketing (Microsoft Rewards, etc.)
-- Health/wellness product marketing
+INBOX — requires MJ to DO something or RESPOND to someone. A real person is waiting or inaction has a consequence.
+DIGEST — useful to know but no action needed (notifications, confirmations, newsletters, alerts, FYI emails).
+ARCHIVE — junk: political fundraising, retail promos, travel deals, marketing, reward programs.
 
-KEEP if the email is:
-- Personal communication from a real person
-- Transactional: order confirmation, delivery update, appointment reminder, billing alert
-- Useful automated digest or newsletter with substantive content (tech, news, professional)
-- Job alert or career opportunity
-- School/community communication about specific events or updates
-- Financial or budgeting alerts
-- Security alerts from Google/Apple/Microsoft
+Core rule: if MJ doesn't need to do anything or respond to anyone → not INBOX.
 
-For each email, respond with exactly this JSON format (array, no markdown):
-[
-  {"id": "...", "action": "keep|archive", "summary": "One sentence summary for digest (only if keep, else empty string)"}
-]
+Return ONLY a JSON array, no markdown:
+[{"id":"...","tier":"inbox|digest|archive","summary":"One sentence (inbox: what action; digest: what happened; archive: empty)"}]
 
-Emails to classify:
-${emailList}`;
+Emails:
+${list}`;
 
-  const response = await fetch(
+  const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: "POST",
@@ -145,230 +106,121 @@ ${emailList}`;
       }),
     }
   );
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${err}`);
-  }
-
-  const data = await response.json();
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
+  const data = await res.json();
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "[]";
-
-  // Strip markdown fences if present
-  const clean = text.replace(/```json\n?|\n?```/g, "").trim();
-  return JSON.parse(clean);
+  return JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim());
 }
 
-// ─── Gmail Operations ─────────────────────────────────────────────────────────
-
-async function archiveThread(gmail, threadId) {
-  if (isDryRun) {
-    console.log(`[DRY RUN] Would archive thread ${threadId}`);
-    return;
-  }
-  await gmail.users.threads.modify({
-    userId: "me",
-    id: threadId,
-    requestBody: { removeLabelIds: ["INBOX"] },
-  });
+async function archiveThread(gmail, id) {
+  if (isDryRun) { console.log(`[DRY RUN] archive ${id}`); return; }
+  await gmail.users.threads.modify({ userId: "me", id, requestBody: { removeLabelIds: ["INBOX"] } });
 }
 
-async function sendDigest(gmail, kept) {
-  if (kept.length === 0) {
-    console.log("No emails to digest — skipping send.");
-    return;
-  }
+function row(e) {
+  const from = e.from.replace(/<.*>/, "").trim();
+  return `<tr><td style="padding:10px 0;border-bottom:1px solid #eee;vertical-align:top;">
+    <b>${from}</b> — ${e.subject}<br>
+    <span style="color:#666;font-size:13px;">${e.summary}</span>
+  </td></tr>`;
+}
 
-  const now = new Date().toLocaleString("en-US", {
-    timeZone: "America/New_York",
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
+async function sendDigest(gmail, inbox, digest) {
+  const total = inbox.length + digest.length;
+  if (total === 0) { console.log("Nothing to digest."); return; }
 
-  const lines = kept
-    .map((e) => `• <b>${e.from}</b> — ${e.subject}<br>&nbsp;&nbsp;<i>${e.summary}</i>`)
-    .join("<br><br>");
+  const now = new Date().toLocaleString("en-US", { timeZone: "America/New_York", dateStyle: "medium", timeStyle: "short" });
 
-  const html = `
-<div style="font-family: Georgia, serif; max-width: 600px; color: #1a1a1a;">
-  <h2 style="border-bottom: 2px solid #333; padding-bottom: 8px;">
-    📬 Inbox Digest — ${now}
-  </h2>
-  <p style="color: #555; font-size: 14px;">
-    ${kept.length} email${kept.length !== 1 ? "s" : ""} worth your attention:
-  </p>
-  <br>
-  ${lines}
-  <br><br>
-  <p style="color: #aaa; font-size: 12px;">
-    Powered by Gemini 2.0 Flash + GitHub Actions
-  </p>
+  const inboxHtml = inbox.length ? `
+    <h3 style="color:#c0392b;margin:24px 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:1px;">⚡ Needs Attention (${inbox.length})</h3>
+    <table style="width:100%;border-collapse:collapse;">${inbox.map(row).join("")}</table>` : "";
+
+  const digestHtml = digest.length ? `
+    <h3 style="color:#555;margin:24px 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:1px;">📋 FYI (${digest.length})</h3>
+    <table style="width:100%;border-collapse:collapse;">${digest.map(row).join("")}</table>` : "";
+
+  const html = `<div style="font-family:-apple-system,Georgia,serif;max-width:620px;color:#1a1a1a;padding:0 16px;">
+  <div style="border-bottom:3px solid #1a1a1a;padding-bottom:12px;margin-bottom:4px;">
+    <h2 style="margin:0;font-size:20px;">📬 Inbox Digest</h2>
+    <p style="margin:4px 0 0;color:#888;font-size:13px;">${now} · ${total} email${total !== 1 ? "s" : ""}</p>
+  </div>
+  ${inboxHtml}${digestHtml}
+  <p style="color:#ccc;font-size:11px;margin-top:32px;">Gemini 2.0 Flash + GitHub Actions</p>
 </div>`;
 
-  const subject = `📬 Inbox Digest (${kept.length} emails) — ${now}`;
-  const raw = makeRawEmail(DIGEST_TO_EMAIL, DIGEST_TO_EMAIL, subject, html);
+  const subject = inbox.length
+    ? `📬 ${inbox.length} need attention, ${digest.length} FYI — ${now}`
+    : `📋 Digest (${digest.length} FYI) — ${now}`;
 
-  if (isDryRun) {
-    console.log(`[DRY RUN] Would send digest to ${DIGEST_TO_EMAIL} with ${kept.length} emails`);
-    return;
-  }
+  const msg = [`From: ${DIGEST_TO_EMAIL}`, `To: ${DIGEST_TO_EMAIL}`, `Subject: ${subject}`,
+    `MIME-Version: 1.0`, `Content-Type: text/html; charset=utf-8`, ``, html].join("\r\n");
+  const raw = Buffer.from(msg).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-  await gmail.users.messages.send({
-    userId: "me",
-    requestBody: { raw },
-  });
-
-  console.log(`✅ Digest sent to ${DIGEST_TO_EMAIL}`);
+  if (isDryRun) { console.log(`[DRY RUN] digest: ${inbox.length} inbox, ${digest.length} FYI`); return; }
+  await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+  console.log(`✅ Digest sent — ${inbox.length} inbox, ${digest.length} FYI`);
 }
-
-function makeRawEmail(from, to, subject, htmlBody) {
-  const message = [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    `MIME-Version: 1.0`,
-    `Content-Type: text/html; charset=utf-8`,
-    ``,
-    htmlBody,
-  ].join("\r\n");
-
-  return Buffer.from(message)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log(`\n🔍 Inbox Triage — lookback: ${LOOKBACK_HOURS}h, dry_run: ${isDryRun}\n`);
-
+  console.log(`\n🔍 Triage — lookback: ${LOOKBACK_HOURS}h, dry_run: ${isDryRun}\n`);
   const gmail = buildGmailClient();
 
-  // Fetch threads from lookback window
-  const cutoffSec = Math.floor((Date.now() - lookbackMs) / 1000);
-  const listRes = await gmail.users.threads.list({
-    userId: "me",
-    labelIds: ["INBOX"],
-    q: `after:${cutoffSec}`,
-    maxResults: 200,
-  });
-
+  const cutoff = Math.floor((Date.now() - lookbackMs) / 1000);
+  const listRes = await gmail.users.threads.list({ userId: "me", labelIds: ["INBOX"], q: `after:${cutoff}`, maxResults: 200 });
   const threads = listRes.data.threads ?? [];
-  console.log(`📥 Found ${threads.length} threads in inbox\n`);
+  console.log(`📥 ${threads.length} threads\n`);
+  if (!threads.length) return;
 
-  if (threads.length === 0) {
-    console.log("Nothing to triage.");
-    return;
-  }
-
-  // Fetch snippets + headers for each thread
   const emails = [];
   for (const t of threads) {
     try {
-      const detail = await gmail.users.threads.get({
-        userId: "me",
-        id: t.id,
-        format: "METADATA",
-        metadataHeaders: ["From", "Subject"],
-      });
-      const msg = detail.data.messages?.[0];
-      const headers = msg?.payload?.headers ?? [];
-      emails.push({
-        id: t.id,
-        from: extractHeader(headers, "From"),
-        subject: extractHeader(headers, "Subject"),
-        snippet: msg?.snippet?.slice(0, 200) ?? "",
-      });
-    } catch (e) {
-      console.warn(`Could not fetch thread ${t.id}: ${e.message}`);
-    }
-    await sleep(50); // gentle rate limiting
+      const d = await gmail.users.threads.get({ userId: "me", id: t.id, format: "METADATA", metadataHeaders: ["From", "Subject"] });
+      const msg = d.data.messages?.[0];
+      const h = msg?.payload?.headers ?? [];
+      emails.push({ id: t.id, from: extractHeader(h, "From"), subject: extractHeader(h, "Subject"), snippet: msg?.snippet?.slice(0, 200) ?? "" });
+    } catch (e) { console.warn(`Skip ${t.id}: ${e.message}`); }
+    await sleep(50);
   }
 
-  // Pre-classify with allowlist/blocklist (no AI needed)
-  const forAI = [];
-  const preKept = [];
-  const preArchived = [];
-
+  const forAI = [], preInbox = [], preDigest = [], preArchive = [];
   for (const e of emails) {
-    if (isAlwaysKeep(e.from)) {
-      preKept.push({ ...e, summary: "(trusted sender — not AI-summarized)" });
-    } else if (isAlwaysArchive(e.from)) {
-      preArchived.push(e);
-    } else {
-      forAI.push(e);
-    }
+    const tier = preClassify(e.from);
+    if (tier === "archive") preArchive.push(e);
+    else if (tier === "inbox") preInbox.push({ ...e, summary: "(see email)" });
+    else if (tier === "digest") preDigest.push({ ...e, summary: e.snippet?.slice(0, 100) ?? "" });
+    else forAI.push(e);
   }
 
-  console.log(
-    `🏷️  Pre-classified: ${preKept.length} keep, ${preArchived.length} archive, ${forAI.length} → AI\n`
-  );
+  console.log(`🏷️  Pre: ${preInbox.length} inbox, ${preDigest.length} digest, ${preArchive.length} archive, ${forAI.length} → AI\n`);
 
-  // Archive pre-classified junk
-  for (const e of preArchived) {
-    console.log(`🗑️  Archive (blocklist): ${e.from} — ${e.subject}`);
-    await archiveThread(gmail, e.id);
-    await sleep(100);
-  }
+  for (const e of preArchive) { console.log(`🗑️  ${e.from} — ${e.subject}`); await archiveThread(gmail, e.id); await sleep(100); }
+  for (const e of preDigest) { console.log(`📋 ${e.from} — ${e.subject}`); await archiveThread(gmail, e.id); await sleep(100); }
 
-  // Run AI classification in batches of 15
-  const aiKept = [];
-  const aiArchived = [];
-  const BATCH = 15;
-
-  for (let i = 0; i < forAI.length; i += BATCH) {
-    const batch = forAI.slice(i, i + BATCH);
-    console.log(`🤖 Classifying batch ${Math.floor(i / BATCH) + 1}/${Math.ceil(forAI.length / BATCH)} (${batch.length} emails)...`);
-
+  const aiInbox = [], aiDigest = [];
+  for (let i = 0; i < forAI.length; i += 15) {
+    const batch = forAI.slice(i, i + 15);
+    console.log(`\n🤖 Batch ${Math.floor(i/15)+1}/${Math.ceil(forAI.length/15)} (${batch.length})...`);
     try {
       const results = await classifyBatch(batch);
-
-      // Map results back by id
-      const resultMap = Object.fromEntries(results.map((r) => [r.id, r]));
-
+      const map = Object.fromEntries(results.map((r) => [r.id, r]));
       for (const e of batch) {
-        const r = resultMap[e.id];
-        if (!r) {
-          console.warn(`No classification for ${e.id}, keeping.`);
-          aiKept.push({ ...e, summary: "(unclassified — kept by default)" });
-          continue;
-        }
-        if (r.action === "archive") {
-          console.log(`🗑️  Archive (AI): ${e.from} — ${e.subject}`);
-          aiArchived.push(e);
-          await archiveThread(gmail, e.id);
-          await sleep(100);
-        } else {
-          console.log(`✅ Keep: ${e.from} — ${e.subject}`);
-          aiKept.push({ ...e, summary: r.summary });
-        }
+        const r = map[e.id];
+        if (!r) { aiInbox.push({ ...e, summary: "(unclassified)" }); continue; }
+        if (r.tier === "archive") { console.log(`🗑️  ${e.from} — ${e.subject}`); await archiveThread(gmail, e.id); await sleep(100); }
+        else if (r.tier === "digest") { console.log(`📋 ${e.from} — ${e.subject}`); aiDigest.push({ ...e, summary: r.summary }); await archiveThread(gmail, e.id); await sleep(100); }
+        else { console.log(`⚡ ${e.from} — ${e.subject}`); aiInbox.push({ ...e, summary: r.summary }); }
       }
     } catch (err) {
-      console.error(`Gemini batch error: ${err.message} — keeping all in batch`);
-      for (const e of batch) {
-        aiKept.push({ ...e, summary: "(AI error — kept by default)" });
-      }
+      console.error(`Gemini error: ${err.message}`);
+      for (const e of batch) aiInbox.push({ ...e, summary: "(AI error)" });
     }
-
-    await sleep(1000); // between batches
+    await sleep(1000);
   }
 
-  // Compile kept emails (AI-classified only — trusted senders go in separately)
-  const digestEmails = [...aiKept];
-
-  // Send digest
-  const totalArchived = preArchived.length + aiArchived.length;
-  console.log(
-    `\n📊 Summary: ${totalArchived} archived, ${digestEmails.length + preKept.length} kept`
-  );
-  console.log(`📨 Sending digest with ${digestEmails.length} AI-triaged emails...\n`);
-
-  await sendDigest(gmail, digestEmails);
+  const allInbox = [...preInbox, ...aiInbox];
+  const allDigest = [...preDigest, ...aiDigest];
+  console.log(`\n📊 ${allInbox.length} inbox, ${allDigest.length} digest`);
+  await sendDigest(gmail, allInbox, allDigest);
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+main().catch((e) => { console.error(e); process.exit(1); });
